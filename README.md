@@ -89,7 +89,13 @@ dst_port)`，在固定的 `session_timeout` 存活时间内，会话的后续正
 `payload`、20～60 字节 `header_bytes`、链路 `mtu` 与 DF 标志
 （`dont_fragment`），以及可选的 `original_offset` /
 `original_more_fragments`（对**已有分片**再次切分时使用），规划该数据报
-在此链路上的分片序列。数据报（首部 + 载荷，不得越过 65535）不超 MTU 时
+在此链路上的分片序列。当 `original_more_fragments=true`（输入是非末片）时，
+载荷长度**必须为 8 字节倍数**，否则返回 422
+（`error=non_aligned_fragment`）；无论是否实际切片，都按
+`original_offset*8 + 载荷长度 + header_bytes` 校验原数据报的绝对结束位置，
+越过 65535 返回 422（`error=datagram_too_large`、`limit=65535`），该约束
+也保证所有输出 `offset` 不超过 8191。两项校验均早于不超 MTU、DF 与切片
+分支。数据报（首部 + 载荷，不得越过 65535）不超 MTU 时
 **原样返回一个分片**（`unfragmented`，保留原始片偏移与 MF）；超限且
 DF=true 时返回 `needs_fragmentation`、**不输出载荷**；其余情况按输入顺序
 切片（`fragmented`）：除最终片外每片载荷取不超过 MTU 的**最大 8 字节
@@ -2059,14 +2065,22 @@ curl -s http://localhost:8000/ipv4/reassemble \
 首部长度、链路 MTU 与 DF 标志，规划该数据报在此链路上发送时所需的分片
 序列；也支持对**已有分片**再次切分（经可选的原始片偏移与原始 MF 描述）。
 
-判定顺序：
+判定顺序（前两项为前置校验，均早于不超 MTU、DF 与切片分支）：
 
-1. **不超 MTU**：`header_bytes + 载荷` 不超过 `mtu` 时**原样返回一个
+1. **非末片对齐**：`original_more_fragments=true` 表示输入本身是某个数据报
+   的非末片，其载荷长度**必须为 8 字节倍数**，否则返回 **422**
+   （`error=non_aligned_fragment`）；
+2. **原数据报上限**：无论是否实际切片，都按
+   `original_offset*8 + 载荷长度 + header_bytes` 校验原数据报的绝对结束
+   位置，越过 IPv4 **65535** 字节上限时返回 **422**
+   （`error=datagram_too_large`，`limit=65535`）；该约束同时保证所有输出
+   `offset` 不超过片偏移字段上限 **8191**；
+3. **不超 MTU**：`header_bytes + 载荷` 不超过 `mtu` 时**原样返回一个
    分片**（`unfragmented`），保留 `original_offset` 与
    `original_more_fragments`；
-2. **超限且 DF=true**：返回 `needs_fragmentation`，`fragments` 为空
+4. **超限且 DF=true**：返回 `needs_fragmentation`，`fragments` 为空
    （**不输出载荷**）；
-3. **其余情况切片**（`fragmented`）：除最终片外，每片载荷取
+5. **其余情况切片**（`fragmented`）：除最终片外，每片载荷取
    `MTU − header_bytes` 向下取整的**最大 8 字节倍数**（片偏移以 8 字节
    计，非末片载荷必须 8 字节对齐），最终片取剩余载荷（长度不要求对齐）；
    各片输出偏移 = `original_offset` + 片内字节偏移 / 8；**最后子片继承
@@ -2085,17 +2099,23 @@ curl -s http://localhost:8000/ipv4/reassemble \
 }
 ```
 
+> `original_more_fragments=true` 的再切分请求，载荷必须为 8 字节对齐长度，
+> 例如 24 字节载荷 `aGVsbG8td29ybGQtaXB2NHJlZnJhLW9r`。
+
 - `payload`：**必填**，数据报载荷的标准 Base64（空串为空载荷）；
-  `header_bytes + 解码后载荷长度` 不得越过 IPv4 **65535** 字节上限。
+  `original_offset*8 + 解码后载荷长度 + header_bytes` 不得越过 IPv4
+  **65535** 字节上限。
 - `header_bytes`：**必填**，IPv4 首部长度，**20～60 的整数**。
 - `mtu`：**必填**，链路 MTU（字节），**正整数**；需要切片时必须能容下
   一个合法非末片载荷（首部长度 + 至少 8 字节），否则 422。
 - `dont_fragment`：**必填**，DF 标志（布尔值，拒绝 `"true"` / `1` 等
   非布尔输入）。
 - `original_offset`：可选，原始片偏移（**8 字节单位**，0～8191 的整数），
-  默认 `0`；各子片偏移在此基础上叠加。
+  默认 `0`；各子片偏移在此基础上叠加；与载荷、首部合计的原数据报绝对
+  结束位置不得越过 65535。
 - `original_more_fragments`：可选，原始 MF 标志（布尔值），默认 `false`；
-  输入本身是某数据报的非末片时为 `true`，切片后最后子片继承该标志。
+  输入本身是某数据报的非末片时为 `true`，此时载荷长度**必须是 8 的倍数**
+  （否则 422 `non_aligned_fragment`），切片后最后子片继承该标志。
 
 #### 响应字段
 
@@ -2104,7 +2124,7 @@ curl -s http://localhost:8000/ipv4/reassemble \
 | `status` | `unfragmented`（原样返回）/ `fragmented`（已切片）/ `needs_fragmentation`（超限且 DF=true） |
 | `fragment_count` | 输出分片数；`needs_fragmentation` 为 0 |
 | `fragments[]` | 分片序列，按输入顺序切片（偏移递增）；`needs_fragmentation` 为空 `[]` |
-| `fragments[].offset` | 片偏移（8 字节单位），已叠加 `original_offset` |
+| `fragments[].offset` | 片偏移（8 字节单位），已叠加 `original_offset`，不超过 8191 |
 | `fragments[].more_fragments` | MF 标志；除最后子片外恒为 `true`，最后子片继承 `original_more_fragments` |
 | `fragments[].payload` | 本片载荷的标准 Base64 |
 | `fragments[].total_length` | 本片 IPv4 总长度（`header_bytes` + 本片载荷字节数），不超 MTU |
@@ -2159,8 +2179,9 @@ DF 禁止，不输出载荷：
 
 #### 响应示例（200，对已有分片再次切分）
 
-`original_offset=2`、`original_more_fragments=true`、20 字节载荷、
-MTU 28：子片偏移叠加原始偏移（2/3/4），最后子片继承原始 MF=true：
+`original_offset=2`、`original_more_fragments=true`、24 字节对齐载荷、
+MTU 28：非末片载荷预算为 8 字节，载荷切成 8/8/8 三片，子片偏移叠加原始
+偏移（2/3/4），最后子片继承原始 MF=true：
 
 ```json
 {
@@ -2169,24 +2190,32 @@ MTU 28：子片偏移叠加原始偏移（2/3/4），最后子片继承原始 MF
   "fragments": [
     {"offset": 2, "more_fragments": true, "payload": "aGVsbG8td28=", "total_length": 28},
     {"offset": 3, "more_fragments": true, "payload": "cmxkLWlwdjQ=", "total_length": 28},
-    {"offset": 4, "more_fragments": true, "payload": "ISEhIQ==",     "total_length": 24}
+    {"offset": 4, "more_fragments": true, "payload": "cmVmcmEtb2s=", "total_length": 28}
   ]
 }
 ```
 
 #### 错误示例（422）
 
+`original_more_fragments=true` 但载荷长度不是 8 的倍数（即使数据报不超
+MTU、不实际切片也返回 422；该校验早于 DF 与 MTU 分支）：
+
+```json
+{"detail": {"error": "non_aligned_fragment", "limit": null}}
+```
+
+原数据报绝对结束位置 `original_offset*8 + 载荷长度 + header_bytes` 越过
+65535（无论是否实际切片，该校验早于 DF 与 MTU 分支）：
+
+```json
+{"detail": {"error": "datagram_too_large", "limit": 65535}}
+```
+
 `header_bytes=20`、`mtu=27`：MTU 容不下一个合法非末片载荷（所需最小
 MTU = 20 + 8 = 28）：
 
 ```json
 {"detail": {"error": "mtu_too_small", "limit": 28}}
-```
-
-首部加载荷越过 65535 字节上限：
-
-```json
-{"detail": {"error": "datagram_too_large", "limit": 65535}}
 ```
 
 #### curl 示例
@@ -2250,9 +2279,12 @@ curl -s http://localhost:8000/ipv4/fragment \
   `dont_fragment`、`header_bytes` 不在 20～60 或不是整数、`mtu` 不是
   正整数、`dont_fragment` / `original_more_fragments` 非布尔、
   `original_offset` 不在 0～8191、`payload` 不是合法标准 Base64；
-  **首部加载荷越过 65535 字节上限**
-  （`detail.error="datagram_too_large"`，`detail.limit=65535`）、
-  **MTU 容不下一个合法非末片载荷**
+  **`original_more_fragments=true` 时载荷长度不是 8 的倍数**
+  （`detail.error="non_aligned_fragment"`，`detail.limit=null`）、
+  **原数据报绝对结束位置 `original_offset*8 + 载荷长度 + header_bytes`
+  越过 65535 字节上限**（早于不超 MTU、DF 与 MTU 分支；
+  `detail.error="datagram_too_large"`，`detail.limit=65535`；该约束同时
+  保证所有输出 `offset` ≤ 8191）、**MTU 容不下一个合法非末片载荷**
   （`detail.error="mtu_too_small"`，`detail.limit` 为所需最小 MTU =
   首部长度 + 8）
 - 非法 CIDR：格式错误、前缀越界（`/33`）、主机位非零（`10.0.0.1/8`）等
@@ -2319,7 +2351,11 @@ audit 与逐地址暴力“最长前缀 + 最低 metric + ECMP”oracle 交叉�
 `/ipv4/fragment` 的不超 MTU 原样返回（含保留原始片偏移/MF、DF 不触发）、
 恰好等于 MTU 的边界、超限且 DF=true 返回 needs_fragmentation 不输出载荷、
 最大 8 字节倍数向下取整切片与 8 字节单位偏移、末片满片/余数片、
-再次切分时子片偏移叠加原始偏移与末子片继承原始 MF、mtu_too_small 边界
+再次切分时子片偏移叠加原始偏移与末子片继承原始 MF、非末片（原始 MF=true）
+载荷未按 8 字节对齐返回 non_aligned_fragment（含早于 unfragmented / DF /
+越界 / mtu_too_small 各分支）、原数据报绝对结束位置越界返回
+datagram_too_large（含早于 unfragmented / DF / mtu_too_small 各分支）与
+65535 边界、输出 offset 不超过 8191、mtu_too_small 边界
 （含 DF 优先与数据报不超 MTU 时不触发）、65535 上限边界、非法
 Base64/类型/标志/偏移 422，以及与 `/ipv4/reassemble` 的随机往返重组
 oracle 属性测试（含二次切分后偏移连续、仅最终子片 MF=false）。
@@ -2336,7 +2372,7 @@ oracle 属性测试（含二次切分后偏移连续、仅最终子片 MF=false�
 │   ├── router.py      # 核心：严格 IPv4 地址校验、最长前缀匹配 + 最低 metric 的 ECMP 路由解析、下一跳故障切换与整表空间审计
 │   ├── firewall.py    # 核心：有序五元组规则首条匹配、正向建会话、反向 stateful 放行（last_seen 刷新）、超时惰性清理与重判、固定容量 LRU 淘汰、乱序/重叠校验
 │   ├── reassembly.py  # 核心：IPv4 分片按字节区间重组、8 字节对齐/唯一末片/65535 上限校验、重叠冲突首个偏移、缺失半开区间合并、贡献分片排序
-│   ├── fragmentation.py # 核心：IPv4 分片规划——不超 MTU 原样返回、DF 超限报 needs_fragmentation、最大 8 字节倍数切片、子片偏移叠加原始偏移、末子片继承原始 MF
+│   ├── fragmentation.py # 核心：IPv4 分片规划——非末片 8 字节对齐与原数据报绝对结束位置 65535 前置校验（输出 offset ≤ 8191）、不超 MTU 原样返回、DF 超限报 needs_fragmentation、最大 8 字节倍数切片、子片偏移叠加原始偏移、末子片继承原始 MF
 │   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/cidrs/diff、/routes/resolve、/routes/failover、/routes/audit、/firewall/simulate、/ipv4/reassemble、/ipv4/fragment 接口
 ├── tests/
 │   ├── test_analyzer.py
@@ -2434,8 +2470,11 @@ oracle 属性测试（含二次切分后偏移连续、仅最终子片 MF=false�
   `(字节偏移, 输入序号)` 排序，空载荷与完全越界（落在末片锚定末尾之后）
   的分片不计入；部分越界分片按总长度裁剪其贡献与重叠校验范围。
 - **分片规划**：`/ipv4/fragment` 复用 reassembly 的 `decode_payload` 与
-  首部/数据报上限常量。先校验首部长度、MTU、标志、原始片偏移与
-  65535 上限，再按“不超 MTU 原样返回 → DF 超限返回
+  首部/数据报上限常量。先校验首部长度、MTU、标志与原始片偏移，随后做
+  **非末片 8 字节对齐（原始 MF=true）→ 原数据报绝对结束位置
+  `original_offset*8 + 载荷长度 + 首部长度 ≤ 65535`** 的语义校验（二者均
+  早于不超 MTU、DF 与切片分支；后者同时保证所有输出 offset ≤ 8191），
+  再按“不超 MTU 原样返回 → DF 超限返回
   `needs_fragmentation`（不输出载荷）→ 切片”的固定顺序判定。切片预算为
   `MTU − 首部长度` 向下取 8 的倍数（非末片载荷的对齐要求），不足 8 字节
   即 `mtu_too_small`（`limit` 为所需最小 MTU = 首部长度 + 8）；随后顺序

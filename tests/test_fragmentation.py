@@ -74,8 +74,9 @@ def test_unfragmented_empty_payload():
 
 
 def test_unfragmented_preserves_original_offset_and_mf():
-    # 已有分片不超新 MTU：原样转发，保留原始片偏移与原始 MF
-    result = plan(20, 1500, False, b"hello", offset=5, mf=True)
+    # 已有分片不超新 MTU：原样转发，保留原始片偏移与原始 MF；
+    # MF=true 的非末片载荷必须 8 字节对齐（这里取 8 字节）
+    result = plan(20, 1500, False, b"A" * 8, offset=5, mf=True)
     assert result["status"] == "unfragmented"
     fragment = result["fragments"][0]
     assert fragment["offset"] == 5
@@ -180,8 +181,9 @@ def test_fragmented_concatenation_restores_payload():
 
 
 def test_refragment_offsets_accumulate_original_offset():
-    # 已有分片：原始偏移 2（字节 16）、原始 MF=true；子片偏移叠加
-    result = plan(20, 28, False, b"A" * 20, offset=2, mf=True)
+    # 已有分片：原始偏移 2（字节 16）、原始 MF=true；非末片载荷必须 8 字节
+    # 对齐，取 24 字节切成三个 8 字节子片，偏移叠加为 2/3/4
+    result = plan(20, 28, False, b"A" * 24, offset=2, mf=True)
     assert result["status"] == "fragmented"
     assert [f["offset"] for f in result["fragments"]] == [2, 3, 4]
     # 最后子片继承原始 MF=true，其余子片 MF=true
@@ -199,11 +201,124 @@ def test_refragment_last_subfragment_inherits_original_mf_false():
 
 
 def test_refragment_max_original_offset():
-    # 数据报 28 字节不超 MTU：原样返回，片偏移为字段最大值 8191
-    result = plan(20, 28, False, b"A" * 8, offset=FRAGMENT_OFFSET_MAX, mf=True)
+    # 不切片时输出 offset 即原始偏移；原数据报不越 65535 时高位 offset 能
+    # 容纳的载荷极小：8189*8 + 0 + 20 = 65532，故 8189 + 空载荷（末片，
+    # MF=false）合法；而 offset=8191 即使空载荷（8191*8+20=65548）也越界。
+    result = plan(20, 65535, False, b"",
+                  offset=8189, mf=False)
     assert result["status"] == "unfragmented"
-    assert result["fragments"][0]["offset"] == FRAGMENT_OFFSET_MAX
+    assert result["fragments"][0]["offset"] == 8189
+    assert result["fragments"][0]["more_fragments"] is False
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 65535, False, b"", offset=FRAGMENT_OFFSET_MAX, mf=False)
+    assert exc_info.value.error == "datagram_too_large"
+
+
+def test_refragment_offsets_never_exceed_8191_when_slicing():
+    # 原始偏移 8180、MF=true 的 72 字节对齐载荷、首部 20：结束位置
+    # 8180*8 + 72 + 20 = 65532 ≤ 65535；MTU 28 切成 9 个 8 字节子片，
+    # 末子片起始偏移 8180+8 = 8188 ≤ 8191。
+    result = plan(20, 28, False, b"A" * 72, offset=8180, mf=True)
+    assert result["status"] == "fragmented"
+    offsets = [f["offset"] for f in result["fragments"]]
+    assert offsets == list(range(8180, 8189))
+    assert max(offsets) <= FRAGMENT_OFFSET_MAX
+
+
+# ---------- 非末片 8 字节对齐校验（早于 unfragmented / DF / MTU 分支） ----------
+
+
+def test_non_aligned_with_original_mf_true_unfragmented():
+    # 不超 MTU 也必须拒绝：5 字节载荷不是 8 的倍数
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 1500, False, b"hello", offset=5, mf=True)
+    assert exc_info.value.error == "non_aligned_fragment"
+    assert exc_info.value.limit is None
+
+
+def test_non_aligned_with_original_mf_true_even_df_true():
+    # 校验早于 DF 分支：100 字节载荷（100%8=4）超 MTU 且 DF=true，
+    # 仍报 non_aligned_fragment 而非 needs_fragmentation
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 28, True, b"x" * 100, offset=1, mf=True)
+    assert exc_info.value.error == "non_aligned_fragment"
+
+
+def test_non_aligned_takes_precedence_over_datagram_too_large():
+    # 同时违反两项时先报 non_aligned_fragment
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 1500, False, b"x" * 65525, offset=1, mf=True)
+    assert exc_info.value.error == "non_aligned_fragment"
+
+
+def test_aligned_payload_with_original_mf_true_ok():
+    # 8 字节倍数的载荷即使不切片也合法
+    result = plan(20, 1500, False, b"A" * 8, offset=5, mf=True)
+    assert result["status"] == "unfragmented"
+    assert result["fragments"][0]["offset"] == 5
     assert result["fragments"][0]["more_fragments"] is True
+
+
+def test_non_aligned_allowed_when_original_mf_false():
+    # 末片（MF=false）载荷不要求对齐，5 字节载荷原样返回
+    result = plan(20, 1500, False, b"hello", offset=5, mf=False)
+    assert result["status"] == "unfragmented"
+    assert result["fragments"][0]["offset"] == 5
+    assert result["fragments"][0]["more_fragments"] is False
+
+
+# ---------- 原数据报绝对结束位置校验（早于 unfragmented / DF / MTU 分支） ----------
+
+
+def test_datagram_end_too_large_with_original_offset_unfragmented():
+    # 单片本身仅 28 字节、不超 MTU，但原数据报绝对结束位置
+    # 8191*8 + 8 + 20 = 65556 > 65535，必须拒绝
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 1500, False, b"A" * 8,
+             offset=FRAGMENT_OFFSET_MAX, mf=True)
+    error = exc_info.value
+    assert error.error == "datagram_too_large"
+    assert error.limit == IPV4_DATAGRAM_MAX
+
+
+def test_datagram_end_too_large_checked_before_df():
+    # 结束位置越界优先于 DF 判定（DF=true 也报 datagram_too_large）
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 28, True, b"A" * 8, offset=8191, mf=True)
+    assert exc_info.value.error == "datagram_too_large"
+
+
+def test_datagram_end_too_large_checked_before_mtu_too_small():
+    # 结束位置越界优先于 mtu_too_small（MTU 同样容不下非末片载荷）
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 20, False, b"A" * 8, offset=8191, mf=True)
+    assert exc_info.value.error == "datagram_too_large"
+
+
+def test_datagram_end_exact_limit_ok():
+    # 结束位置恰好 65535：offset=8188、11 字节末片（MF=false），
+    # 8188*8 + 11 + 20 = 65535
+    result = plan(20, 1500, False, b"A" * 11, offset=8188, mf=False)
+    assert result["status"] == "unfragmented"
+    assert result["fragments"][0]["offset"] == 8188
+    # 再多 1 字节即越界
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 1500, False, b"A" * 12, offset=8188, mf=False)
+    assert exc_info.value.error == "datagram_too_large"
+
+
+def test_datagram_end_boundary_with_mf_true():
+    # MF=true 的对齐载荷：offset=8188、16 字节 → 8188*8+16+20=65540 越界；
+    # offset=8181、64 字节 → 8181*8+64+20=65532 ≤ 65535 合法
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 1500, False, b"A" * 16, offset=8188, mf=True)
+    assert exc_info.value.error == "datagram_too_large"
+    result = plan(20, 28, False, b"A" * 64, offset=8181, mf=True)
+    assert result["status"] == "fragmented"
+    assert [f["offset"] for f in result["fragments"]] == list(
+        range(8181, 8189)
+    )
+    assert max(f["offset"] for f in result["fragments"]) <= FRAGMENT_OFFSET_MAX
 
 
 # ---------- 422 类输入错误 ----------

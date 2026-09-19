@@ -2229,14 +2229,15 @@ def test_fragment_unfragmented_exact_mtu():
 
 
 def test_fragment_unfragmented_preserves_original_offset_and_mf():
+    # MF=true 的非末片载荷必须 8 字节对齐（这里取 8 字节）
     resp = post_fragment(
-        b"hello", original_offset=5, original_more_fragments=True
+        b"A" * 8, original_offset=5, original_more_fragments=True
     )
     assert resp.status_code == 200
     fragment = resp.json()["fragments"][0]
     assert fragment["offset"] == 5
     assert fragment["more_fragments"] is True
-    assert fragment["total_length"] == 25
+    assert fragment["total_length"] == 28
 
 
 def test_fragment_unfragmented_df_true_still_forwards():
@@ -2289,8 +2290,9 @@ def test_fragment_needs_fragmentation_no_payload():
 
 
 def test_fragment_refragment_offsets_and_mf():
+    # 非末片（MF=true）载荷必须 8 字节对齐：24 字节切成三个 8 字节子片
     resp = post_fragment(
-        b"A" * 20, mtu=28, original_offset=2, original_more_fragments=True
+        b"A" * 24, mtu=28, original_offset=2, original_more_fragments=True
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -2300,6 +2302,7 @@ def test_fragment_refragment_offsets_and_mf():
     assert [f["more_fragments"] for f in body["fragments"]] == [
         True, True, True,
     ]
+    # 末片（MF=false）不要求对齐：20 字节切成 8/8/4
     resp = post_fragment(
         b"A" * 20, mtu=28, original_offset=7, original_more_fragments=False
     )
@@ -2327,6 +2330,87 @@ def test_fragment_datagram_too_large_422():
     resp = post_fragment(b"\x00" * 65475, header_bytes=60, mtu=65535)
     assert resp.status_code == 200
     assert resp.json()["status"] == "unfragmented"
+
+
+def test_fragment_non_aligned_original_non_last_422():
+    # original_more_fragments=true 但载荷 5 字节、不是 8 的倍数；
+    # 即使数据报本身不超 MTU（unfragmented 分支）也必须 422
+    resp = post_fragment(
+        b"hello", mtu=1500, original_offset=5, original_more_fragments=True
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == {
+        "error": "non_aligned_fragment",
+        "limit": None,
+    }
+    # 校验早于 DF 分支：DF=true 超 MTU 同样报 non_aligned_fragment
+    resp = post_fragment(
+        b"x" * 100, mtu=28, dont_fragment=True,
+        original_offset=1, original_more_fragments=True,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "non_aligned_fragment"
+    # 同时越界时对齐错误优先
+    resp = post_fragment(
+        b"x" * 65525, mtu=1500,
+        original_offset=1, original_more_fragments=True,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "non_aligned_fragment"
+    # 末片（MF=false）不要求对齐
+    resp = post_fragment(
+        b"hello", mtu=1500, original_offset=5, original_more_fragments=False
+    )
+    assert resp.status_code == 200
+    assert resp.json()["fragments"][0]["offset"] == 5
+
+
+def test_fragment_datagram_end_too_large_with_offset_422():
+    # 单片仅 28 字节、不超 MTU，但原数据报绝对结束位置
+    # 8191*8 + 8 + 20 = 65556 > 65535
+    resp = post_fragment(
+        b"A" * 8, mtu=1500,
+        original_offset=8191, original_more_fragments=True,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == {
+        "error": "datagram_too_large",
+        "limit": 65535,
+    }
+    # 结束位置校验早于 DF 分支
+    resp = post_fragment(
+        b"A" * 8, mtu=28, dont_fragment=True,
+        original_offset=8191, original_more_fragments=True,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "datagram_too_large"
+    # 结束位置校验早于 mtu_too_small 分支
+    resp = post_fragment(
+        b"A" * 8, mtu=20,
+        original_offset=8191, original_more_fragments=True,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "datagram_too_large"
+    # 结束位置恰好 65535（offset=8188、11 字节末片）合法
+    resp = post_fragment(
+        b"A" * 11, mtu=1500,
+        original_offset=8188, original_more_fragments=False,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["fragments"][0]["offset"] == 8188
+
+
+def test_fragment_output_offsets_never_exceed_8191():
+    # offset=8180、MF=true 的 72 字节对齐载荷（结束位置 65532 ≤ 65535），
+    # MTU 28 切成 9 片，最大输出 offset 8188 ≤ 8191
+    resp = post_fragment(
+        b"A" * 72, mtu=28,
+        original_offset=8180, original_more_fragments=True,
+    )
+    assert resp.status_code == 200
+    offsets = [f["offset"] for f in resp.json()["fragments"]]
+    assert offsets == list(range(8180, 8189))
+    assert max(offsets) <= 8191
 
 
 def test_fragment_validation_422():

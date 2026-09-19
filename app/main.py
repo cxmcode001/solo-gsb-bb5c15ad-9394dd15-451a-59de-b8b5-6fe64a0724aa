@@ -83,8 +83,10 @@ app = FastAPI(
         "返回首个冲突偏移，无冲突但有缺口返回合并后的缺失半开区间，覆盖"
         "完整时返回贡献分片索引与重组后的 Base64 载荷。"
         "通过 /ipv4/fragment 做反向的分片规划：给定 Base64 载荷、20～60 "
-        "字节首部长度、MTU 与 DF 标志（可选原始片偏移与原始 MF），数据报"
-        "不超 MTU 时原样返回一个分片，超限且 DF=true 时返回 "
+        "字节首部长度、MTU 与 DF 标志（可选原始片偏移与原始 MF），"
+        "original_more_fragments=true 时载荷必须 8 字节对齐，并按"
+        " original_offset*8 + 载荷长度 + 首部长度校验原数据报不越 65535；"
+        "数据报不超 MTU 时原样返回一个分片，超限且 DF=true 时返回 "
         "needs_fragmentation（不输出载荷），其余情况按不超过 MTU 的最大 "
         "8 字节倍数切片，子片偏移叠加原始片偏移、末子片继承原始 MF。"
     ),
@@ -1005,7 +1007,7 @@ class IPv4FragmentRequest(BaseModel):
         ...,
         description=(
             "数据报载荷的标准 Base64 编码（空串为空载荷）；"
-            "header_bytes + 解码后载荷长度不得超过 65535"
+            "original_offset*8 + 解码后载荷长度 + header_bytes 不得超过 65535"
         ),
     )
     header_bytes: int = Field(
@@ -1027,13 +1029,15 @@ class IPv4FragmentRequest(BaseModel):
         default=0, ge=0, le=FRAGMENT_OFFSET_MAX, strict=True,
         description=(
             "原始片偏移（8 字节单位，0～8191），对已有分片再次切分时使用；"
-            "各子片偏移在此基础上叠加；默认 0"
+            "各子片偏移在此基础上叠加；默认 0；"
+            "original_offset*8 + 载荷长度 + header_bytes 不得越过 65535"
         ),
     )
     original_more_fragments: bool = Field(
         default=False,
         description=(
-            "原始 MF 标志：输入本身是某数据报的非末片时为 true；"
+            "原始 MF 标志：输入本身是某数据报的非末片时为 true，此时载荷"
+            "长度必须是 8 的倍数（否则 422 non_aligned_fragment）；"
             "切片后最后子片继承该标志，其余子片 MF=true"
         ),
     )
@@ -1058,7 +1062,13 @@ class IPv4PlannedFragment(BaseModel):
     """规划输出的单个分片：8 字节单位偏移 + MF 标志 + Base64 载荷 + 总长度。"""
 
     offset: int = Field(
-        ..., description="片偏移（fragment offset），以 8 字节为单位（已叠加原始片偏移）"
+        ...,
+        ge=0,
+        le=FRAGMENT_OFFSET_MAX,
+        description=(
+            "片偏移（fragment offset），以 8 字节为单位（已叠加原始片偏移），"
+            "不超过 8191"
+        ),
     )
     more_fragments: bool = Field(
         ...,
@@ -2176,8 +2186,20 @@ def ipv4_reassemble(
             "content": {
                 "application/json": {
                     "examples": {
+                        "non_aligned_fragment": {
+                            "summary": "original_more_fragments=true 但载荷不是 8 字节倍数",
+                            "value": {
+                                "detail": {
+                                    "error": "non_aligned_fragment",
+                                    "limit": None,
+                                }
+                            },
+                        },
                         "datagram_too_large": {
-                            "summary": "首部加载荷越过 IPv4 65535 字节上限",
+                            "summary": (
+                                "原数据报绝对结束位置 original_offset*8 + "
+                                "载荷长度 + 首部长度越过 IPv4 65535 字节上限"
+                            ),
                             "value": {
                                 "detail": {
                                     "error": "datagram_too_large",
@@ -2223,9 +2245,9 @@ def ipv4_fragment(
                 },
             },
             "refragment": {
-                "summary": "对已有分片（原始偏移 2、原始 MF=true）再次切分",
+                "summary": "对已有分片（原始偏移 2、原始 MF=true，24 字节对齐载荷）再次切分",
                 "value": {
-                    "payload": "aGVsbG8td29ybGQtaXB2NCEhISE=",
+                    "payload": "aGVsbG8td29ybGQtaXB2NHJlZnJhLW9r",
                     "header_bytes": 20,
                     "mtu": 28,
                     "dont_fragment": False,
@@ -2236,7 +2258,20 @@ def ipv4_fragment(
         },
     ),
 ) -> dict:
-    """规划 IPv4 数据报（或其中一个已有分片）在指定 MTU 链路上的分片序列：
+    """规划 IPv4 数据报（或其中一个已有分片）在指定 MTU 链路上的分片序列。
+
+    以下两项校验**早于**不超 MTU、DF 与切片分支：
+
+    - **非末片对齐**：``original_more_fragments=true`` 表示输入本身是某个
+      数据报的非末片，其载荷长度**必须为 8 的倍数**，否则返回 **422**
+      （``error="non_aligned_fragment"``）；
+    - **原数据报上限**：无论是否实际切片，都按
+      ``original_offset*8 + 载荷长度 + header_bytes`` 校验原数据报的绝对
+      结束位置，越过 IPv4 **65535** 字节上限时返回 **422**
+      （``error="datagram_too_large"``，``limit=65535``）；该约束同时保证
+      所有输出 ``offset`` 不超过片偏移字段上限 **8191**。
+
+    通过上述校验后按以下顺序判定：
 
     - **不超 MTU**：``header_bytes + 载荷`` 不超过 ``mtu`` 时原样返回一个
       分片（``unfragmented``），保留 ``original_offset`` 与
@@ -2249,15 +2284,13 @@ def ipv4_fragment(
       ``original_offset`` + 片内字节偏移 / 8（8 字节单位）；**最后子片
       继承原始 MF**，其余子片 MF=true。
 
-    每片返回 ``offset``（8 字节单位）、``more_fragments``、Base64
-    ``payload`` 与 ``total_length``（首部长度 + 本片载荷字节数，不超
+    每片返回 ``offset``（8 字节单位，不超过 8191）、``more_fragments``、
+    Base64 ``payload`` 与 ``total_length``（首部长度 + 本片载荷字节数，不超
     MTU）；输出与 /ipv4/reassemble 的输入同构，可直接往返重组。
 
-    ``header_bytes + 载荷`` 越过 IPv4 **65535** 字节上限时返回 **422**
-    （``error="datagram_too_large"``，``limit=65535``）；需要切片而 MTU
-    连一个合法非末片载荷（首部长度 + 至少 8 字节）都容不下时返回 **422**
-    （``error="mtu_too_small"``，``limit`` 为所需最小 MTU）。非法
-    Base64、非布尔 ``dont_fragment`` / ``original_more_fragments``、
+    需要切片而 MTU 连一个合法非末片载荷（首部长度 + 至少 8 字节）都容不下
+    时返回 **422**（``error="mtu_too_small"``，``limit`` 为所需最小 MTU）。
+    非法 Base64、非布尔 ``dont_fragment`` / ``original_more_fragments``、
     ``original_offset`` 不在 0～8191、``mtu`` 非正整数等同样返回 **422**。
     """
     try:

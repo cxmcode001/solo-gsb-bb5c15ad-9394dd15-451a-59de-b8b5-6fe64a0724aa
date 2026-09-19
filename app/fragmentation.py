@@ -4,18 +4,27 @@
 可选的原始片偏移与原始 MF 标志（用于对**已有分片**再次切分），规划该
 数据报在此链路上发送时所需的分片序列：
 
-1. **不超 MTU**：数据报（首部 + 载荷）不超过 MTU 时原样返回一个分片
+1. **非末片对齐**：``original_more_fragments=true`` 表示输入本身就是某个
+   数据报的非末片，其载荷长度**必须为 8 字节倍数**（否则无法在合法片偏移
+   边界上再次切分），否则抛出 :class:`FragmentationInputError`
+   （``non_aligned_fragment``，Web 层映射为 422）；
+2. **原数据报上限**：按 ``original_offset*8 + 载荷长度 + 首部长度`` 计算
+   原数据报的绝对结束位置，越过 65535 字节上限时抛出
+   :class:`FragmentationInputError`（``datagram_too_large``，Web 层映射为
+   422）。该位置不越 65535 也保证所有输出 offset 不超过 13 位片偏移字段
+   上限 8191；
+3. **不超 MTU**：数据报（首部 + 载荷）不超过 MTU 时原样返回一个分片
    （``unfragmented``），保留原始片偏移与原始 MF；
-2. **超限且 DF=true**：返回 ``needs_fragmentation``，不输出任何分片
+4. **超限且 DF=true**：返回 ``needs_fragmentation``，不输出任何分片
    （不输出载荷）；
-3. **其余情况切片**（``fragmented``）：除最终片外，每片载荷取不超过
+5. **其余情况切片**（``fragmented``）：除最终片外，每片载荷取不超过
    MTU 的**最大 8 字节倍数**（片偏移以 8 字节计，非末片载荷必须 8 字节
    对齐），最终片取剩余载荷（长度不要求对齐）。各片输出偏移 =
    原始片偏移 + 片内字节偏移 / 8；**最后子片继承原始 MF**，其余子片
    MF=true。
 
-输入约束：首部 + 载荷不得超过 IPv4 数据报 65535 字节上限；需要切片时
-MTU 必须能容下一个合法非末片载荷（首部长度 + 至少 8 字节），否则抛出
+输入约束：前两项校验早于不超 MTU、DF 与切片分支；需要切片时 MTU 必须能
+容下一个合法非末片载荷（首部长度 + 至少 8 字节），否则抛出
 :class:`FragmentationInputError`（Web 层映射为 422）。
 """
 from __future__ import annotations
@@ -45,6 +54,7 @@ NEEDS_FRAGMENTATION = "needs_fragmentation"
 ERR_INVALID_HEADER_LENGTH = "invalid_header_length"
 ERR_INVALID_MTU = "invalid_mtu"
 ERR_INVALID_FRAGMENT_OFFSET = "invalid_fragment_offset"
+ERR_NON_ALIGNED_FRAGMENT = "non_aligned_fragment"
 ERR_DATAGRAM_TOO_LARGE = "datagram_too_large"
 ERR_MTU_TOO_SMALL = "mtu_too_small"
 
@@ -53,8 +63,8 @@ class FragmentationInputError(ValueError):
     """分片规划输入不合法（Web 层映射为 422）。
 
     - ``error``：错误类型标识（``invalid_header_length`` / ``invalid_mtu``
-      / ``invalid_fragment_offset`` / ``datagram_too_large`` /
-      ``mtu_too_small``）；
+      / ``invalid_fragment_offset`` / ``non_aligned_fragment`` /
+      ``datagram_too_large`` / ``mtu_too_small``）；
     - ``limit``：相关阈值——``datagram_too_large`` 为 65535 字节上限，
       ``mtu_too_small`` 为能容下一个合法非末片载荷的最小 MTU
       （首部长度 + 8），其余为 ``None``。
@@ -131,7 +141,8 @@ def plan_ipv4_fragmentation(
     - ``payload``：载荷字节串（独立使用时也接受标准 Base64 字符串）；
     - ``original_offset``：原始片偏移（8 字节单位，0～8191，默认 0）；
     - ``original_more_fragments``：原始 MF 标志（布尔值，默认
-      ``False``）——输入本身是某个数据报的非末片时为 ``True``。
+      ``False``）——输入本身是某个数据报的非末片时为 ``True``，此时载荷
+      长度必须是 8 的倍数。
 
     返回结构（按结论三选一）：
 
@@ -146,10 +157,17 @@ def plan_ipv4_fragmentation(
     ``offset`` 以 8 字节计、``payload`` 为标准 Base64、``total_length``
     为首部长度 + 本片载荷字节数（不超过 MTU）。
 
-    语义类输入错误抛出 :class:`FragmentationInputError`（首部长度 / MTU /
-    原始片偏移非法、首部加载荷越过 65535、MTU 容不下一个合法非末片载荷）；
-    非法 Base64、非布尔标志等抛出 :class:`ValueError`（Web 层通常已在
-    入口拦截）。
+    以下语义校验早于不超 MTU、DF 与切片分支：``original_more_fragments``
+    为 ``True`` 而载荷长度不是 8 的倍数时抛出
+    :class:`FragmentationInputError`（``non_aligned_fragment``）；原数据报
+    绝对结束位置 ``original_offset*8 + len(payload) + header_length`` 越过
+    65535 时抛出 :class:`FragmentationInputError`
+    （``datagram_too_large``，``limit=65535``）——该约束同时保证所有输出
+    offset 不超过片偏移字段上限 8191。需要切片而 MTU 容不下一个合法非末片
+    载荷（首部长度 + 至少 8 字节）时同样抛出
+    :class:`FragmentationInputError`（``mtu_too_small``）；首部长度 / MTU
+    / 原始片偏移非法亦抛出该异常；非法 Base64、非布尔标志等抛出
+    :class:`ValueError`（Web 层通常已在入口拦截）。
     """
     header = _validate_header_length(header_length)
     mtu = _validate_mtu(mtu)
@@ -166,15 +184,33 @@ def plan_ipv4_fragmentation(
     if not isinstance(payload, (bytes, bytearray)):
         raise ValueError("payload 必须是 Base64 字符串或字节串")
     payload = bytes(payload)
+    payload_length = len(payload)
 
-    datagram_length = header + len(payload)
-    if datagram_length > IPV4_DATAGRAM_MAX:
+    # 输入是非末片（original MF=true）：其载荷必须按 8 字节对齐，否则既不
+    # 能作为合法非末片原样转发，也无法在 8 字节边界上再次切分。
+    if original_more_fragments and payload_length % OFFSET_UNIT != 0:
+        raise FragmentationInputError(
+            ERR_NON_ALIGNED_FRAGMENT,
+            f"original_more_fragments=true 的分片载荷长度 {payload_length} "
+            f"不是 {OFFSET_UNIT} 的倍数",
+        )
+
+    # 原数据报绝对结束位置 = 原始片偏移*8 + 载荷长度 + 首部长度。
+    # 该值不越 65535 即保证所有输出 offset ≤ 8191：
+    # - 不切片时输出 offset 即原始偏移，已由入参校验限定在 0～8191；
+    # - 切片时（载荷非空）任一片起始偏移 ≤ offset + (载荷长度-1)//8，
+    #   乘 8 得 ≤ offset*8 + 载荷长度 - 8 ≤ 65535 - header - 8 ≤ 65507，
+    #   故该偏移 ≤ floor(65507/8) = 8188 < FRAGMENT_OFFSET_MAX(8191)。
+    datagram_end = offset * OFFSET_UNIT + payload_length + header
+    if datagram_end > IPV4_DATAGRAM_MAX:
         raise FragmentationInputError(
             ERR_DATAGRAM_TOO_LARGE,
-            f"数据报长度 {datagram_length} 越过 IPv4 "
+            f"原数据报绝对结束位置 {datagram_end} 越过 IPv4 "
             f"{IPV4_DATAGRAM_MAX} 字节上限",
             limit=IPV4_DATAGRAM_MAX,
         )
+
+    datagram_length = header + payload_length
 
     def build_fragment(
         chunk: bytes, byte_offset: int, more_fragments: bool
@@ -213,7 +249,6 @@ def plan_ipv4_fragmentation(
         )
 
     fragments: list[dict] = []
-    payload_length = len(payload)
     byte_offset = 0
     while byte_offset < payload_length:
         chunk = payload[byte_offset:byte_offset + max_nonfinal]
