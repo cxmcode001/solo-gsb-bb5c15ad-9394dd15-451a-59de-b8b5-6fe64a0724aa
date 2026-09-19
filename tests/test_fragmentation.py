@@ -75,7 +75,8 @@ def test_unfragmented_empty_payload():
 
 def test_unfragmented_preserves_original_offset_and_mf():
     # 已有分片不超新 MTU：原样转发，保留原始片偏移与原始 MF
-    result = plan(20, 1500, False, b"hello", offset=5, mf=True)
+    # （原始 MF=true 的非末片载荷必须 8 字节对齐，这里用 8 字节载荷）
+    result = plan(20, 1500, False, b"hello!!!", offset=5, mf=True)
     assert result["status"] == "unfragmented"
     fragment = result["fragments"][0]
     assert fragment["offset"] == 5
@@ -181,7 +182,8 @@ def test_fragmented_concatenation_restores_payload():
 
 def test_refragment_offsets_accumulate_original_offset():
     # 已有分片：原始偏移 2（字节 16）、原始 MF=true；子片偏移叠加
-    result = plan(20, 28, False, b"A" * 20, offset=2, mf=True)
+    # （非末片载荷 24 字节为 8 的倍数，切成 8/8/8）
+    result = plan(20, 28, False, b"A" * 24, offset=2, mf=True)
     assert result["status"] == "fragmented"
     assert [f["offset"] for f in result["fragments"]] == [2, 3, 4]
     # 最后子片继承原始 MF=true，其余子片 MF=true
@@ -199,11 +201,99 @@ def test_refragment_last_subfragment_inherits_original_mf_false():
 
 
 def test_refragment_max_original_offset():
-    # 数据报 28 字节不超 MTU：原样返回，片偏移为字段最大值 8191
-    result = plan(20, 28, False, b"A" * 8, offset=FRAGMENT_OFFSET_MAX, mf=True)
+    # 字段最大值 8191 本身合法，但 8191*8 + 载荷 + 首部必然越过 65535，
+    # 携带载荷时按 datagram_too_large 拒绝；该数据报不越界的最大可用
+    # 原始偏移为 8188（8188*8 + 8 + 20 = 65532 ≤ 65535）
+    result = plan(20, 28, False, b"A" * 8, offset=8188, mf=True)
     assert result["status"] == "unfragmented"
-    assert result["fragments"][0]["offset"] == FRAGMENT_OFFSET_MAX
+    assert result["fragments"][0]["offset"] == 8188
     assert result["fragments"][0]["more_fragments"] is True
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 28, False, b"A" * 8, offset=FRAGMENT_OFFSET_MAX, mf=True)
+    assert exc_info.value.error == "datagram_too_large"
+
+
+# ---------- 再次切分的前置校验（早于 unfragmented / DF / MTU 分支） ----------
+
+
+def test_refragment_nonfinal_payload_must_align():
+    # 原始 MF=true 表示输入是非末片：载荷长度必须是 8 字节倍数
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 1500, False, b"hello", offset=5, mf=True)
+    error = exc_info.value
+    assert error.error == "non_aligned_fragment"
+    assert error.limit is None
+    # 8 字节倍数即合法
+    result = plan(20, 1500, False, b"hello!!!", offset=5, mf=True)
+    assert result["status"] == "unfragmented"
+
+
+def test_non_aligned_checked_before_all_branches():
+    # 对齐校验早于 unfragmented / DF / MTU 分支
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 1500, False, b"A" * 5, mf=True)  # 本可走 unfragmented
+    assert exc_info.value.error == "non_aligned_fragment"
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 1500, True, b"A" * 5, mf=True)  # DF=true
+    assert exc_info.value.error == "non_aligned_fragment"
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 27, False, b"A" * 5, mf=True)  # MTU 也容不下非末片载荷
+    assert exc_info.value.error == "non_aligned_fragment"
+    # 原始 MF=false（末片/完整数据报）无对齐要求
+    assert plan(20, 1500, False, b"A" * 5, mf=False)["status"] == "unfragmented"
+
+
+def test_non_aligned_checked_before_datagram_size():
+    # 同时违反对齐与绝对结束位置时，对齐错误优先（与重组模块的校验顺序一致）
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 1500, False, b"A" * 5, offset=8189, mf=True)
+    assert exc_info.value.error == "non_aligned_fragment"
+
+
+def test_absolute_end_too_large():
+    # 原数据报绝对结束位置 = original_offset*8 + 载荷 + 首部：
+    # 8189*8 + 8 + 20 = 65540 > 65535（数据报本身仅 28 字节，本可原样返回）
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 1500, False, b"A" * 8, offset=8189, mf=True)
+    error = exc_info.value
+    assert error.error == "datagram_too_large"
+    assert error.limit == IPV4_DATAGRAM_MAX
+
+
+def test_absolute_end_exact_limit_ok():
+    # 8188*8 + 11 + 20 = 65535：恰好不越界（末片载荷可不对齐）
+    result = plan(20, 1500, False, b"A" * 11, offset=8188, mf=False)
+    assert result["status"] == "unfragmented"
+    assert result["fragments"][0]["offset"] == 8188
+    # 越 1 字节即 422
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 1500, False, b"A" * 12, offset=8188, mf=False)
+    assert exc_info.value.error == "datagram_too_large"
+
+
+def test_absolute_end_checked_before_all_branches():
+    # 绝对结束位置校验早于 unfragmented / DF / MTU 分支
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 65535, False, b"A" * 8, offset=8189, mf=True)  # 本可原样返回
+    assert exc_info.value.error == "datagram_too_large"
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 65535, True, b"A" * 8, offset=8189, mf=True)  # DF=true
+    assert exc_info.value.error == "datagram_too_large"
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 27, False, b"A" * 8, offset=8189, mf=True)  # MTU 也容不下
+    assert exc_info.value.error == "datagram_too_large"
+
+
+def test_output_offsets_never_exceed_8191():
+    # 大偏移合法切片：全部输出偏移 ≤ 8191
+    result = plan(20, 28, False, b"A" * 480, offset=8000, mf=True)
+    assert result["status"] == "fragmented"
+    assert max(f["offset"] for f in result["fragments"]) <= FRAGMENT_OFFSET_MAX
+    # 若放行将切出 8191/8192 的非法偏移：8191*8 + 16 + 20 = 65564 > 65535，
+    # 被绝对结束位置校验拦截
+    with pytest.raises(FragmentationInputError) as exc_info:
+        plan(20, 28, False, b"A" * 16, offset=FRAGMENT_OFFSET_MAX, mf=True)
+    assert exc_info.value.error == "datagram_too_large"
 
 
 # ---------- 422 类输入错误 ----------
